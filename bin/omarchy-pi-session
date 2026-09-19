@@ -97,6 +97,21 @@ def hypr_clients() -> list[dict[str, Any]]:
         return []
 
 
+def active_hypr_client() -> dict[str, Any] | None:
+    try:
+        result = subprocess.run(
+            ["hyprctl", "activewindow", "-j"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        parsed = json.loads(result.stdout)
+        return parsed if isinstance(parsed, dict) and parsed.get("address") else None
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return None
+
+
 def tmux_target(tty: str) -> tuple[str, str, str, str] | None:
     try:
         panes = subprocess.run(
@@ -129,6 +144,52 @@ def tmux_target(tty: str) -> tuple[str, str, str, str] | None:
         return title, pane[2], pane[1], pane[3]
     except (OSError, subprocess.SubprocessError):
         return None
+
+
+def session_is_focused(record: dict[str, Any]) -> bool:
+    active = active_hypr_client()
+    if not active:
+        return False
+
+    active_title = str(active.get("title", ""))
+    terminal_title = str(record.get("terminalTitle", ""))
+    instance_id = str(record.get("instanceId", ""))
+    tmux = tmux_target(str(record.get("tty", "")))
+
+    if not tmux:
+        return bool(
+            active_title == terminal_title
+            or (instance_id and active_title.endswith(f"· {instance_id}"))
+        )
+
+    try:
+        clients = subprocess.run(
+            ["tmux", "list-clients", "-F", "#{client_name}\t#{session_name}"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        ).stdout.splitlines()
+        for line in clients:
+            fields = line.split("\t")
+            if len(fields) < 2 or fields[1] != tmux[3]:
+                continue
+            view = subprocess.run(
+                ["tmux", "display-message", "-c", fields[0], "-p", "#{pane_id}\t#{host}:#{window_name}"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=3,
+            ).stdout.strip().split("\t", 1)
+            if len(view) == 2 and view[0] == tmux[2] and (
+                active_title == view[1]
+                or active_title == terminal_title
+                or (instance_id and active_title.endswith(f"· {instance_id}"))
+            ):
+                return True
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return False
 
 
 def focus(record: dict[str, Any]) -> bool:
@@ -260,6 +321,8 @@ def notify_done(record: dict[str, Any]) -> bool:
             return True
         history = (history + [key])[-100:]
         history_path.write_text(json.dumps(history))
+        if session_is_focused(record):
+            return True
         result = subprocess.run(
             [
                 "omarchy", "notification", "send",

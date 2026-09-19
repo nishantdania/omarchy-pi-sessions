@@ -10,7 +10,7 @@ An Omarchy bar widget for monitoring live [Pi](https://pi.dev) coding sessions.
 - Short task titles generated with `openai-codex/gpt-5.6-luna` at low reasoning
 - Click a session to focus its exact terminal
 - Tmux pane selection and detached-session reattachment
-- Clickable, deduplicated completion notifications
+- Clickable, deduplicated completion notifications, suppressed while you are viewing that session
 - Automatic removal when Pi exits
 - No generated Pi session names
 
