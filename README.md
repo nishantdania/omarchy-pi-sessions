@@ -2,6 +2,8 @@
 
 An Omarchy bar widget for monitoring live [Pi](https://pi.dev) coding sessions.
 
+![Omarchy Pi Sessions panel](assets/screenshot.png)
+
 ## Features
 
 - Running and waiting session sections
