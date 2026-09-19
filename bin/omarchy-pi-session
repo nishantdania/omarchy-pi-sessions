@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+STATE_ROOT = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "pi"
+STATE_DIR = STATE_ROOT / "session-tracker"
+NOTIFY_DIR = STATE_ROOT / "session-tracker-notifications"
+
+def iso_time(value: str) -> datetime:
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return datetime.fromtimestamp(0, timezone.utc)
+
+
+def process_start_ticks(pid: int) -> str:
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text()
+        fields = raw[raw.rfind(") ") + 2 :].split()
+        return fields[19] if len(fields) > 19 else ""
+    except (OSError, ValueError):
+        return ""
+
+
+def is_live(record: dict[str, Any]) -> bool:
+    try:
+        pid = int(record.get("pid", 0))
+    except (TypeError, ValueError):
+        return False
+    expected = str(record.get("processStartTicks", ""))
+    actual = process_start_ticks(pid)
+    return bool(actual and (not expected or actual == expected))
+
+
+def load_records() -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    for path in STATE_DIR.glob("*.json"):
+        try:
+            record = json.loads(path.read_text())
+            if not isinstance(record, dict):
+                continue
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        live = is_live(record)
+        if not live or record.get("status") == "closed":
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            continue
+
+        record["live"] = True
+        record["statePath"] = str(path)
+        records.append(record)
+
+    status_rank = {"running": 0, "waiting": 1, "done": 1, "idle": 1, "closed": 2}
+    records.sort(
+        key=lambda item: (
+            status_rank.get(str(item.get("status", "closed")), 4),
+            -iso_time(str(item.get("activityAt", ""))).timestamp(),
+        )
+    )
+    return records
+
+
+def get_record(instance_id: str) -> dict[str, Any]:
+    for record in load_records():
+        if str(record.get("instanceId")) == instance_id:
+            return record
+    raise SystemExit(f"Pi session not found: {instance_id}")
+
+
+def hypr_clients() -> list[dict[str, Any]]:
+    try:
+        result = subprocess.run(
+            ["hyprctl", "clients", "-j"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        parsed = json.loads(result.stdout)
+        return parsed if isinstance(parsed, list) else []
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return []
+
+
+def tmux_target(tty: str) -> tuple[str, str, str, str] | None:
+    try:
+        panes = subprocess.run(
+            ["tmux", "list-panes", "-a", "-F", "#{pane_tty}\t#{pane_id}\t#{session_name}:#{window_index}\t#{session_name}"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        ).stdout.splitlines()
+        pane = next((line.split("\t") for line in panes if line.split("\t")[0] == tty), None)
+        if not pane or len(pane) < 4:
+            return None
+        clients = subprocess.run(
+            ["tmux", "list-clients", "-F", "#{client_name}\t#{session_name}"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        ).stdout.splitlines()
+        client = next((line.split("\t")[0] for line in clients if line.split("\t")[-1] == pane[3]), "")
+        title = ""
+        if client:
+            title = subprocess.run(
+                ["tmux", "display-message", "-c", client, "-p", "#{host}:#{window_name}"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=3,
+            ).stdout.strip()
+        return title, pane[2], pane[1], pane[3]
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def focus(record: dict[str, Any]) -> bool:
+    terminal_title = str(record.get("terminalTitle", ""))
+    instance_id = str(record.get("instanceId", ""))
+    tmux = tmux_target(str(record.get("tty", "")))
+    clients = hypr_clients()
+
+    match = next((client for client in clients if str(client.get("title", "")) == terminal_title), None)
+    if match is None and instance_id:
+        suffix = f"· {instance_id}"
+        match = next((client for client in clients if str(client.get("title", "")).endswith(suffix)), None)
+    if match is None and tmux and tmux[0]:
+        match = next((client for client in clients if str(client.get("title", "")) == tmux[0]), None)
+    if not match or not match.get("address"):
+        return False
+
+    if tmux:
+        subprocess.run(["tmux", "select-window", "-t", tmux[1]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["tmux", "select-pane", "-t", tmux[2]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    address = str(match["address"])
+    if not address.startswith("0x") or not all(char in "0123456789abcdefABCDEF" for char in address[2:]):
+        return False
+    result = subprocess.run(
+        ["hyprctl", "eval", f"hl.dispatch(hl.dsp.focus({{ window = 'address:{address}' }}))"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def notify_failure(headline: str, description: str) -> None:
+    try:
+        subprocess.Popen(
+            ["omarchy", "notification", "send", "-u", "normal", headline, description],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        pass
+
+
+def reopen(record: dict[str, Any]) -> bool:
+    cwd = Path(str(record.get("cwd", Path.home()))).expanduser()
+    if not cwd.is_dir():
+        cwd = Path.home()
+
+    command = [shutil.which("pi") or "pi"]
+    session_file = str(record.get("sessionFile", ""))
+    if session_file and Path(session_file).is_file():
+        command.extend(["--session", session_file])
+
+    launcher = [
+        "setsid",
+        "uwsm-app",
+        "--",
+        "xdg-terminal-exec",
+        f"--dir={cwd}",
+        *command,
+    ]
+    try:
+        subprocess.Popen(
+            launcher,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return True
+    except OSError:
+        return False
+
+
+def attach_tmux(record: dict[str, Any]) -> bool:
+    target = tmux_target(str(record.get("tty", "")))
+    if not target:
+        return False
+    subprocess.run(["tmux", "select-window", "-t", target[1]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["tmux", "select-pane", "-t", target[2]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    cwd = Path(str(record.get("cwd", Path.home()))).expanduser()
+    if not cwd.is_dir():
+        cwd = Path.home()
+    try:
+        subprocess.Popen(
+            [
+                "setsid", "uwsm-app", "--", "xdg-terminal-exec", f"--dir={cwd}",
+                "tmux", "attach-session", "-t", target[3],
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return True
+    except OSError:
+        return False
+
+
+def activate(record: dict[str, Any]) -> bool:
+    if is_live(record):
+        if focus(record) or attach_tmux(record):
+            return True
+        notify_failure("Pi terminal not found", str(record.get("title", "The Pi process is still running")))
+        return False
+    if reopen(record):
+        return True
+    notify_failure("Could not reopen Pi", str(record.get("title", "Session launch failed")))
+    return False
+
+
+def notify_done(record: dict[str, Any]) -> bool:
+    if record.get("status") != "done":
+        return True
+    NOTIFY_DIR.mkdir(parents=True, exist_ok=True)
+    key = f"{record.get('instanceId', '')}:{record.get('settledAt', '')}"
+    lock_path = NOTIFY_DIR / "lock"
+    history_path = NOTIFY_DIR / "history.json"
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            history = json.loads(history_path.read_text())
+            if not isinstance(history, list):
+                history = []
+        except (OSError, json.JSONDecodeError):
+            history = []
+        if key in history:
+            return True
+        history = (history + [key])[-100:]
+        history_path.write_text(json.dumps(history))
+        result = subprocess.run(
+            [
+                "omarchy", "notification", "send",
+                "--app-name", "Pi",
+                "-u", "normal",
+                "-t", "12000",
+                "Pi finished",
+                f"{record.get('title', 'Pi session')} is ready to check",
+                "--exec", str(Path(__file__).resolve()), "activate", str(record.get("instanceId", "")),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return result.returncode == 0
+
+
+def usage() -> None:
+    print("Usage: omarchy-pi-session <list|focus|open|activate|notify> [instance-id]", file=sys.stderr)
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        usage()
+        return 2
+
+    action = sys.argv[1]
+    if action == "list":
+        print(json.dumps(load_records(), separators=(",", ":")))
+        return 0
+    if action not in {"focus", "open", "activate", "notify"} or len(sys.argv) != 3:
+        usage()
+        return 2
+
+    record = get_record(sys.argv[2])
+    if action == "focus":
+        ok = focus(record)
+    elif action == "open":
+        ok = reopen(record)
+    elif action == "activate":
+        ok = activate(record)
+    else:
+        ok = notify_done(record)
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

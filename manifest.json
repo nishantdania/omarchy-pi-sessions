@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "nishant.pi-sessions",
+  "name": "Pi Sessions",
+  "version": "1.0.0",
+  "author": "Nishant",
+  "license": "MIT",
+  "description": "Live Pi coding sessions with status, notifications, and click-to-focus.",
+  "kinds": ["bar-widget"],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Pi Sessions",
+    "description": "Shows running, waiting, and finished Pi sessions.",
+    "category": "AI",
+    "defaultSection": "right",
+    "aliases": ["pi", "sessions", "pi-sessions"],
+    "allowMultiple": false
+  }
+}

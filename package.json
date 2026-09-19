@@ -1,0 +1,26 @@
+{
+  "name": "omarchy-pi-sessions",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "An Omarchy bar widget for monitoring and focusing Pi coding sessions.",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "omarchy",
+    "quickshell"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/pi-session-tracker.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  }
+}
